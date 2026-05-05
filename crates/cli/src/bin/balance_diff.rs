@@ -10,12 +10,14 @@
 //!
 //! ## Why this works on historical corpora
 //!
-//! Unlike `archival-diff` (which would need a slot-aware archival
-//! account fetcher Solana RPC doesn't expose — `getAccountInfo`
-//! has no historical-slot parameter on any major provider),
-//! `getTransaction` is fully archival on Helius / Triton / QuickNode.
-//! That means this binary can validate parser correctness on a
-//! months-old mainnet sandwich corpus with the standard public RPC.
+//! `getTransaction` is fully archival on Helius / Triton / QuickNode,
+//! so this binary can validate parser correctness on a months-old
+//! mainnet sandwich corpus with the standard public RPC. Replay-side
+//! validation (reserves / sqrt_price after the backrun) requires
+//! slot-aware archival account fetching, which no major Solana RPC
+//! exposes today; the underlying library functions live in
+//! [`pool_state::compare_clmm_replay_to_archival`] and friends, ready
+//! for a Geyser-backed or ledger-replay fetcher when one's wired up.
 //!
 //! ## What it validates
 //!
@@ -23,8 +25,9 @@
 //! points to a parser-stable failure mode: account-key drift between
 //! block snapshot and tx fetch (e.g. lookup-table updates),
 //! token-balance representation differences, RPC-side serialisation
-//! inconsistencies. **Replay-math bugs do not show up here** — they
-//! live in `archival-diff`'s reserves / sqrt_price comparison.
+//! inconsistencies. **Replay-math bugs do not show up here** — those
+//! would surface only in a reserves / sqrt_price comparison against
+//! post-backrun chain state, which needs the archival fetcher above.
 //!
 //! ## Output shape
 //!
@@ -99,9 +102,8 @@ async fn main() -> Result<()> {
             continue;
         }
         // Header / heartbeat lines from `sandwich-detect`'s JSONL stream
-        // aren't sandwich attacks — skip them silently. Same string-check
-        // gate `archival-diff` uses; full deserialise of every line as
-        // `SandwichAttack` would fail loudly on those.
+        // aren't sandwich attacks — skip them silently. Cheap string check
+        // before deserialisation, which would otherwise fail loudly on those.
         if trimmed.contains("\"_header\"") || trimmed.contains("\"_heartbeat\"") {
             continue;
         }
