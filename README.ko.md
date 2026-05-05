@@ -8,8 +8,7 @@
 
 <p align="center">
   <a href="README.md">English</a> &middot;
-  <strong>한국어</strong> &middot;
-  <a href="README.es.md">Español</a>
+  <strong>한국어</strong>
 </p>
 
 <p align="center">
