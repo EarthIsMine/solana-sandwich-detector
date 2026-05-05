@@ -8,8 +8,7 @@
 
 <p align="center">
   <a href="README.md">English</a> &middot;
-  <strong>한국어</strong> &middot;
-  <a href="README.es.md">Español</a>
+  <strong>한국어</strong>
 </p>
 
 <p align="center">
@@ -120,7 +119,7 @@ sandwich-detect --rpc $RPC_URL --range 285012000-285012100 --window 4 --summary
 
 Phoenix(CLOB)와 multi-hop Jupiter route 는 v1 에서 detection-only; 미수신 enrichment 가시성을 위해 per-DEX heartbeat 메트릭으로 추적됩니다.
 
-> **자세한 방법론** — 탐지 규칙 표, DEX별 replay primitive, evidence/confidence 분류 (5-카테고리 신호 ensemble + Tier 3 경제 신호), 검증 전략 (golden/adversarial corpus + property-based + real-mainnet capture as fixture) — 은 [DESIGN.md](DESIGN.md) 참조 (영문).
+> **자세한 방법론** — 탐지 규칙 표, DEX별 replay primitive, evidence/confidence 분류 (5-카테고리 신호 ensemble + Tier 3 경제 신호), 검증 전략 (golden/adversarial corpus + property-based + real-mainnet capture as fixture) — 은 [DESIGN.ko.md](DESIGN.ko.md) 참조.
 
 ---
 

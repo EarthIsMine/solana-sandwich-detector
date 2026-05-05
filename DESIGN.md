@@ -1,5 +1,10 @@
 # Design
 
+<p align="center">
+  <strong>English</strong> &middot;
+  <a href="DESIGN.ko.md">한국어</a>
+</p>
+
 This document describes how the detector works: its detection model, AMM-replay
 enrichment, evidence/confidence taxonomy, and validation methodology. The
 [README](README.md) covers install, CLI usage, and the Vigil integration
