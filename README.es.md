@@ -114,75 +114,13 @@ sandwich-detect --rpc $RPC_URL --range 285012000-285012100 --window 4 --summary
 
 ## Cómo funciona
 
-### Detección same-block
+El detector emite un `SandwichAttack` cuando tres swaps en un pool encajan en un patrón frontrun / víctima / backrun: el mismo atacante en las dos puntas, direcciones opuestas, víctima en medio con un signer distinto y la misma dirección que el frontrun. La **detección same-block** maneja el patrón clásico de un solo slot; la **detección cross-slot por ventana** cubre ataques que abarcan hasta W slots, con filtros de procedencia de bundles Jito, factibilidad económica y plausibilidad de víctima encima para producir una puntuación de confianza compuesta.
 
-```
-Bloque (slot N)
- |
- +-- Parsear transacciones --> Extraer eventos de swap por DEX
- |                              (instruction accounts + deltas de balance de tokens)
- |
- +-- Agrupar por pool
- |
- +-- Detectar patrón:
-      tx[i]  attacker BUYS   -+
-      tx[j]  victim   BUYS    +-- mismo pool, misma dirección
-      tx[k]  attacker SELLS  -+   dirección opuesta, mismo signer que tx[i]
-```
+Cuando una detección se dispara, el **enriquecimiento por replay AMM** recalcula la pérdida de la víctima reproduciendo el swap a través de la propia matemática del pool dos veces — una con el frontrun (el mundo real) y otra sin él (el contrafactual) — y tomando la diferencia. Los pools de producto constante se reproducen directamente desde `pre/post_token_balances` del meta de la tx; los AMMs de liquidez concentrada (Whirlpool, Raydium CLMM, DLMM) obtienen el snapshot dinámico de la cuenta del pool vía `getAccountInfo`; Pump.fun recupera sus reservas virtuales del log Anchor `TradeEvent` que emite por swap. Los números correctos por replay pueden invertir la decisión por reglas: un sandwich que parecía rentable según `amount_out − amount_in` puede mostrar una *pérdida* del atacante una vez que el round-trip se reproduce en la denominación correcta del token.
 
-### Detección cross-slot por ventana
+Phoenix (CLOB) y rutas multi-hop de Jupiter son detection-only en v1; la métrica heartbeat por DEX rastrea la cobertura para que los consumidores vean qué pasó sin enriquecer.
 
-```
-Slot N:    attacker BUYS en pool P    (frontrun)
-Slot N+1:  victim BUYS en pool P      (misma dirección que frontrun)
-Slot N+2:  attacker SELLS en pool P   (backrun — dirección opuesta)
-```
-
-El detector cross-slot (`FilteredWindowDetector`) mantiene una ventana deslizante de W slots por pool y aplica tres filtros de precisión:
-
-1. **Procedencia de bundles** — co-localización de bundles Jito (AtomicBundle > SpanningBundle > TipRace > Organic)
-2. **Factibilidad económica** — `backrun.amount_out - frontrun.amount_in > comisiones de tx`
-3. **Plausibilidad de víctima** — chequeo de razón de tamaño + exclusión de atacantes conocidos
-
-A cada detección se le asigna una **puntuación de confianza** compuesta (0.0–1.0) ponderada por estos filtros.
-
-### Reglas de detección
-
-| Condición | Por qué |
-|-----------|---------|
-| `frontrun.signer == backrun.signer` | Mismo atacante |
-| `frontrun.direction != backrun.direction` | Trades opuestos (compra y luego venta) |
-| `victim.direction == frontrun.direction` | La víctima empuja el precio aún más |
-| `victim.signer != attacker` | Wallet diferente |
-| Mismo pool | El impacto en el precio es local al pool |
-| Mismo slot (same-block) o dentro de W slots (window) | Proximidad temporal |
-
-El detector usa un **enfoque de parsing híbrido**: los discriminators de instrucciones identifican el programa DEX y el pool, mientras que los cambios de balance pre/post de tokens determinan dirección y montos del swap. Más robusto que decodificar puramente la instrucción, ya que sigue funcionando aunque el formato cambie.
-
-### Medición del victim loss (replay AMM)
-
-La detección por reglas responde *"¿esto fue un sandwich?"* pero no *"¿cuánto perdió la víctima?"* — la heurística ingenua `backrun.amount_out - frontrun.amount_in` se rompe en pares multi-token e ignora la dinámica del impacto en el precio. La crate `pool-state` resuelve ambas cosas reproduciendo cada swap con la matemática propia del AMM:
-
-```
-state_0  = reservas del pool justo antes del frontrun  (de tx meta)
-state_1  = state_0 después del frontrun                 (replay)
-state_2  = state_1 después de la víctima                (replay, "actual")
-state_2c = state_0 después de la víctima, sin frontrun  (replay, "contrafactual")
-victim_loss = victim_out(state_2c) - victim_out(state_2)
-```
-
-Las reservas de cada paso vienen de los `pre_token_balances` / `post_token_balances` de la propia transacción — no se requiere RPC histórico para pools de producto constante. Los AMMs de liquidez concentrada (Whirlpool, Raydium CLMM, DLMM) requieren el snapshot dinámico (`sqrt_price` / `liquidity` / `active_id`), obtenido vía `getAccountInfo` sobre la cuenta del pool; el trait `AccountFetcher` permite enchufar proveedores archival para backfill. Pump.fun es un caso especial — sus `virtual_*_reserves` de bonding curve se recuperan del log Anchor `TradeEvent` que Pump.fun emite por swap, por lo que no requiere RPC extra y el replay archival funciona directamente.
-
-Cuando el enriquecimiento tiene éxito, cada `SandwichAttack` recibe:
-
-- `victim_loss_lamports` — AMM-correcto, en la unidad mínima del token quote
-- `victim_loss_lamports_lower` / `_upper` — intervalo de confianza derivado de los residuales parser-vs-modelo por paso
-- `attacker_profit` — ganancia bruta contrafactual del atacante (difiere de `estimated_attacker_profit` cuando la lógica por reglas sobre-atribuye)
-- `price_impact_bps` — desplazamiento de precio inducido por el frontrun (en bps)
-- `severity` — categoría según la razón loss/TVL del pool
-- Trace por DEX: `amm_replay` (producto constante), `clmm_replay` (V3-style: Whirlpool + Raydium CLMM), `dlmm_replay` — permite a un consumidor downstream recalcular la pérdida desde la aritmética cruda
-
-Los ataques en DEXes no soportados (Phoenix actualmente; rutas de Jupiter a través de pools subyacentes no soportados también cuentan) pasan con estos campos en `None`. Las rutas multi-hop de Jupiter aparecen como `cross_boundary_unsupported` en la métrica heartbeat — single-hop pivota a través del replay path existente del DEX subyacente.
+> **Para la metodología en detalle** — tabla de reglas, primitivas de replay por DEX, taxonomía de evidencia/confianza (ensemble de 5 categorías de señales + señales económicas Tier 3) y la estrategia de validación (corpora golden + adversarial + property-based + captura mainnet real como fixture) — ver [DESIGN.md](DESIGN.md) (en inglés).
 
 ---
 

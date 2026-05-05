@@ -114,75 +114,13 @@ sandwich-detect --rpc $RPC_URL --range 285012000-285012100 --window 4 --summary
 
 ## How It Works
 
-### Same-block detection
+The detector emits a `SandwichAttack` when three swaps in a pool match a frontrun / victim / backrun pattern: same attacker on the outer two, opposite directions, victim sandwiched between them with a different signer and the same direction as the frontrun. **Same-block detection** handles the classic single-slot pattern; **cross-slot window detection** handles attacks spanning up to W slots, with Jito bundle provenance, economic feasibility, and victim plausibility filters layered on top to produce a composite confidence score.
 
-```
-Block (slot N)
- |
- +-- Parse transactions --> Extract swap events per DEX
- |                          (instruction accounts + token balance deltas)
- |
- +-- Group by pool
- |
- +-- Detect pattern:
-      tx[i]  attacker BUYS   -+
-      tx[j]  victim   BUYS    +-- same pool, same direction
-      tx[k]  attacker SELLS  -+   opposite direction, same signer as tx[i]
-```
+When a detection fires, **AMM-replay enrichment** recomputes the victim's loss by running the swap through the pool's own math twice — once with the frontrun (the actual world) and once without (the counterfactual world) — and taking the difference. Constant-product pools replay from `pre/post_token_balances` in the tx meta directly; concentrated-liquidity AMMs (Whirlpool, Raydium CLMM, DLMM) fetch the pool account's dynamic snapshot via `getAccountInfo`; Pump.fun recovers its virtual reserves from the `TradeEvent` Anchor log it emits per swap. Replay-correct numbers can flip the rule-based call: a sandwich that looked profitable by `amount_out − amount_in` may show an attacker *loss* once the round-trip is replayed in the right token denomination.
 
-### Cross-slot window detection
+Phoenix (CLOB) and multi-hop Jupiter routes are detection-only at v1; the per-DEX heartbeat metric tracks coverage so consumers can see what passed through unenriched.
 
-```
-Slot N:    attacker BUYS in pool P   (frontrun)
-Slot N+1:  victim BUYS in pool P     (same direction as frontrun)
-Slot N+2:  attacker SELLS in pool P  (backrun -- opposite direction)
-```
-
-The cross-slot detector (`FilteredWindowDetector`) maintains a per-pool sliding window of W slots and applies three precision filters:
-
-1. **Bundle provenance** — Jito bundle co-location (AtomicBundle > SpanningBundle > TipRace > Organic)
-2. **Economic feasibility** — `backrun.amount_out - frontrun.amount_in > tx fees`
-3. **Victim plausibility** — Size ratio check + known-attacker exclusion
-
-Each detection gets a composite **confidence score** (0.0-1.0) weighted across these filters.
-
-### Detection rules
-
-| Condition | Why |
-|-----------|-----|
-| `frontrun.signer == backrun.signer` | Same attacker |
-| `frontrun.direction != backrun.direction` | Opposite trades (buy then sell) |
-| `victim.direction == frontrun.direction` | Victim pushes price further |
-| `victim.signer != attacker` | Different wallet |
-| Same pool | Price impact is local to the pool |
-| Same slot (same-block) or within W slots (window) | Temporal proximity |
-
-The detector uses a **hybrid parsing approach**: instruction discriminators identify the DEX program and pool address, while pre/post token balance changes determine swap direction and amounts. More robust than pure instruction decoding since it works even when instruction formats change.
-
-### Victim loss measurement (AMM replay)
-
-Rule-based detection answers *"was this a sandwich?"* but not *"how much did the victim lose?"* — the naive `backrun.amount_out - frontrun.amount_in` heuristic breaks for multi-token pairs and ignores price-impact dynamics. The `pool-state` crate fixes both by replaying each swap through the AMM's own math:
-
-```
-state_0  = pool reserves just before the frontrun  (from tx meta)
-state_1  = state_0 after frontrun                  (replay)
-state_2  = state_1 after victim                    (replay, "actual")
-state_2c = state_0 after victim, no frontrun       (replay, "counterfactual")
-victim_loss = victim_out(state_2c) - victim_out(state_2)
-```
-
-Reserves at each step come from the transaction's own `pre_token_balances` / `post_token_balances` — no historical RPC needed for constant-product pools. Concentrated-liquidity AMMs (Whirlpool, Raydium CLMM, DLMM) need the dynamic `sqrt_price` / `liquidity` / `active_id` snapshot, fetched via `getAccountInfo` on the pool account; the `AccountFetcher` trait lets you plug in archival providers for backfill. Pump.fun is a special case — its bonding-curve `virtual_*_reserves` are recovered from the `TradeEvent` Anchor log Pump.fun emits per swap, so no extra RPC is needed and archival replay works out of the box.
-
-When enrichment succeeds, each `SandwichAttack` gets:
-
-- `victim_loss_lamports` — AMM-correct, in the quote token's smallest unit
-- `victim_loss_lamports_lower` / `_upper` — confidence interval derived from per-step parser-vs-model residuals
-- `attacker_profit` — counterfactual attacker gross profit (differs from `estimated_attacker_profit` when rule-based logic over-attributes)
-- `price_impact_bps` — frontrun-induced price shift in basis points
-- `severity` — bucket from the loss-to-pool-TVL ratio
-- Per-DEX trace: `amm_replay` (constant product), `clmm_replay` (V3-style: Whirlpool + Raydium CLMM), `dlmm_replay` (DLMM) — lets a downstream consumer recompute the loss from raw arithmetic
-
-Attacks on unsupported DEXes (Phoenix today; Jupiter routes through unsupported underlying pools count too) pass through with these fields set to `None`. Multi-hop Jupiter routes surface as `cross_boundary_unsupported` on the heartbeat metric — single-hop pivots through the underlying DEX's existing replay path.
+> **For the methodology in detail** — detection rules table, per-DEX replay primitives, evidence/confidence taxonomy (5-category signal ensemble + Tier 3 economic signals), and the validation strategy (golden corpora + property-based + real-mainnet capture as fixture) — see [DESIGN.md](DESIGN.md).
 
 ---
 

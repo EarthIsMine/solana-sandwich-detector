@@ -114,75 +114,13 @@ sandwich-detect --rpc $RPC_URL --range 285012000-285012100 --window 4 --summary
 
 ## 동작 원리
 
-### Same-block 탐지
+탐지기는 한 pool 안에서 세 swap이 frontrun / victim / backrun 패턴을 이룰 때 `SandwichAttack` 을 emit합니다 — 외곽 두 leg는 같은 attacker, 반대 방향, 가운데 victim은 다른 signer + frontrun과 같은 방향. **Same-block 탐지**가 단일 슬롯 내 고전 패턴을, **cross-slot 윈도우 탐지**가 W 슬롯에 걸친 공격을 처리합니다. cross-slot 쪽은 Jito 번들 출처 / 경제적 타당성 / 피해자 그럴듯함 세 가지 정밀 필터를 layered해 합성 신뢰도 점수를 산출합니다.
 
-```
-Block (slot N)
- |
- +-- 트랜잭션 파싱 --> DEX별 swap 이벤트 추출
- |                     (instruction accounts + 토큰 잔액 변화)
- |
- +-- pool 별 그룹화
- |
- +-- 패턴 탐지:
-      tx[i]  attacker BUYS   -+
-      tx[j]  victim   BUYS    +-- 같은 pool, 같은 방향
-      tx[k]  attacker SELLS  -+   반대 방향, tx[i]와 같은 signer
-```
+탐지가 발화하면 **AMM 재연 enrichment** 가 victim의 손실을 pool 자체 수학으로 두 번 — frontrun 적용 (실제) + 미적용 (반사실) — 재연하고 그 차로 계산합니다. Constant-product pool은 tx 메타의 `pre/post_token_balances` 만으로 재연; concentrated-liquidity AMM (Whirlpool, Raydium CLMM, DLMM)은 pool 계정의 동적 스냅샷을 `getAccountInfo` 로 가져옴; Pump.fun 은 swap마다 emit되는 `TradeEvent` Anchor log 에서 가상 reserves 를 복원합니다. 재연 정확한 수치는 규칙 기반 판정을 뒤집을 수 있음 — `amount_out − amount_in` 으로는 수익으로 보이는 sandwich 가, 토큰 단위 정렬해 round-trip 재연하면 attacker 손실로 드러나는 케이스가 있음.
 
-### Cross-slot 윈도우 탐지
+Phoenix(CLOB)와 multi-hop Jupiter route 는 v1 에서 detection-only; 미수신 enrichment 가시성을 위해 per-DEX heartbeat 메트릭으로 추적됩니다.
 
-```
-Slot N:    pool P에서 attacker BUYS    (frontrun)
-Slot N+1:  pool P에서 victim BUYS      (frontrun과 같은 방향)
-Slot N+2:  pool P에서 attacker SELLS   (backrun — 반대 방향)
-```
-
-`FilteredWindowDetector`는 pool별 W-슬롯 슬라이딩 윈도우를 유지하며 세 가지 정밀 필터를 적용합니다:
-
-1. **번들 출처** — Jito 번들 동소성 (AtomicBundle > SpanningBundle > TipRace > Organic)
-2. **경제적 타당성** — `backrun.amount_out - frontrun.amount_in > 트랜잭션 수수료`
-3. **피해자 그럴듯함** — 사이즈 비율 검사 + 알려진 공격자 제외
-
-각 탐지에 가중 합성 **신뢰도 점수**(0.0–1.0)가 매겨집니다.
-
-### 탐지 규칙
-
-| 조건 | 이유 |
-|------|------|
-| `frontrun.signer == backrun.signer` | 같은 공격자 |
-| `frontrun.direction != backrun.direction` | 반대 거래 (사고 → 팔고) |
-| `victim.direction == frontrun.direction` | 피해자가 가격을 더 밀어줌 |
-| `victim.signer != attacker` | 다른 지갑 |
-| 같은 pool | 가격 영향이 그 pool에 국지적 |
-| 같은 slot 또는 윈도우 W 내 | 시간적 근접성 |
-
-탐지기는 **하이브리드 파싱**을 사용합니다: instruction discriminator로 DEX 프로그램과 pool 주소를 식별하고, pre/post 토큰 잔액 변화로 swap 방향과 금액을 결정합니다. 순수 instruction 디코딩보다 견고 — instruction 형식이 바뀌어도 동작.
-
-### Victim loss 계측 (AMM 재연)
-
-규칙 기반 탐지는 *"이게 샌드위치였나?"*에 답할 뿐, *"피해자는 얼마를 잃었나?"*는 답하지 못합니다 — 단순 `backrun.amount_out - frontrun.amount_in` 휴리스틱은 multi-token 페어에서 깨지고 가격 영향 동학을 무시합니다. `pool-state` 크레이트는 각 swap을 AMM의 자체 수학으로 재연해서 둘 다 해결합니다:
-
-```
-state_0  = frontrun 직전 pool 잔액  (tx 메타에서)
-state_1  = frontrun 적용 후 state_0  (재연)
-state_2  = victim 적용 후 state_1   (재연, "실제")
-state_2c = frontrun 없이 victim     (재연, "반사실")
-victim_loss = victim_out(state_2c) - victim_out(state_2)
-```
-
-각 단계의 잔액은 트랜잭션 자체의 `pre_token_balances` / `post_token_balances`에서 옴 — constant-product pool은 historical RPC 불필요. Concentrated-liquidity AMM (Whirlpool, Raydium CLMM, DLMM)은 동적 `sqrt_price` / `liquidity` / `active_id` 스냅샷이 필요하며 pool 계정에 `getAccountInfo`로 가져옴; `AccountFetcher` trait를 통해 백필용 archival provider를 끼워 넣을 수 있습니다. Pump.fun은 별개 — bonding-curve `virtual_*_reserves`를 Pump.fun이 swap마다 emit하는 `TradeEvent` Anchor log에서 복원하므로 추가 RPC 없이 동작 + archival replay도 그대로 가능.
-
-Enrichment 성공 시 각 `SandwichAttack`은 다음을 갖습니다:
-
-- `victim_loss_lamports` — AMM 정확, quote 토큰 최소 단위
-- `victim_loss_lamports_lower` / `_upper` — 단계별 parser-vs-model 잔차에서 도출한 신뢰 구간
-- `attacker_profit` — 반사실 attacker 총 이익 (rule 기반이 과대 귀속할 때 `estimated_attacker_profit`과 차이 발생)
-- `price_impact_bps` — frontrun이 유발한 가격 변화 (bp)
-- `severity` — loss 대비 pool TVL 비율의 버킷
-- DEX별 trace: `amm_replay`(constant product), `clmm_replay` (V3-style: Whirlpool + Raydium CLMM), `dlmm_replay` — 다운스트림 소비자가 raw 산술로 loss를 재계산 가능
-
-미지원 DEX (현재 Phoenix; Jupiter route가 미지원 underlying pool 거치는 경우 포함)의 공격은 이 필드들이 `None`인 채로 통과됩니다. Multi-hop Jupiter route는 heartbeat 메트릭의 `cross_boundary_unsupported`로 분류 — single-hop은 underlying DEX의 기존 replay path로 pivot됨.
+> **자세한 방법론** — 탐지 규칙 표, DEX별 replay primitive, evidence/confidence 분류 (5-카테고리 신호 ensemble + Tier 3 경제 신호), 검증 전략 (golden/adversarial corpus + property-based + real-mainnet capture as fixture) — 은 [DESIGN.md](DESIGN.md) 참조 (영문).
 
 ---
 
