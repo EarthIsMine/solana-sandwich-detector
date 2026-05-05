@@ -9,10 +9,6 @@ name = "sandwich-detect"
 path = "src/main.rs"
 
 [[bin]]
-name = "archival-diff"
-path = "src/bin/archival_diff.rs"
-
-[[bin]]
 name = "balance-diff"
 path = "src/bin/balance_diff.rs"
 
